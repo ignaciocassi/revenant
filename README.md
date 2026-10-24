@@ -7,6 +7,8 @@ to *its own* conversation.
 Two panes open on the same repo come back to their two different sessions, not to
 "whatever ran there last".
 
+![demo](https://www.image2url.com/r2/default/gifs/1792872851398-e3eca7ed-ee9d-42a6-af5a-016c1103d253.gif)
+
 ## How it works
 
 Warp gives every local pane a stable id (`WARP_TERMINAL_SESSION_UUID`) that
