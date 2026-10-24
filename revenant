@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# revenant — admin CLI for revenant.
+#
+# install / uninstall / doctor / config / account / enable / disable, plus
+# read-only list/status. Runtime commands that need your shell (resume) are
+# provided by the sourced shell function of the same name, which shadows this
+# script for those.
+
+set -uo pipefail
+
+# Locate the runtime lib + bundled source files: prefer this script's own dir
+# (running from the repo), fall back to the installed location.
+_self="${BASH_SOURCE[0]}"
+while [[ -h $_self ]]; do _t="$(readlink "$_self")"; [[ $_t == /* ]] && _self="$_t" || _self="$(dirname "$_self")/$_t"; done
+SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
+LIB="$SRC_DIR/revenant.bash"
+[[ -f $LIB ]] || LIB="$HOME/.revenant/revenant.bash"
+
+: "${REVENANT_HOME:=$HOME/.revenant}"
+: "${REVENANT_CONFIG_FILE:=$REVENANT_HOME/config}"
+
+# shellcheck source=/dev/null
+REVENANT_NOAUTO=1 source "$LIB"
+_revenant_load_config
+
+c_cyan=$'\033[1;36m'; c_dim=$'\033[2m'; c_warn=$'\033[1;33m'; c_err=$'\033[1;31m'; c_ok=$'\033[1;32m'; c_off=$'\033[0m'
+say()  { printf '%s==>%s %s\n' "$c_cyan" "$c_off" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
+err()  { printf '%serror:%s %s\n' "$c_err" "$c_off" "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# config file editing
+# ---------------------------------------------------------------------------
+_rv_cfg_set() {   # key value   (replace line or append)
+    local key="$1" val="$2" tmp
+    mkdir -p "$REVENANT_HOME"; chmod 0700 "$REVENANT_HOME" 2>/dev/null
+    [[ -f $REVENANT_CONFIG_FILE ]] || { umask 077; : > "$REVENANT_CONFIG_FILE"; }
+    tmp="$(mktemp "${REVENANT_CONFIG_FILE}.XXXX")"
+    local found=0 line k
+    while IFS= read -r line || [[ -n $line ]]; do
+        k="${line%%=*}"; k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        if [[ $k == "$key" && $line == *=* && $line != \#* ]]; then
+            printf '%s = %s\n' "$key" "$val" >> "$tmp"; found=1
+        else
+            printf '%s\n' "$line" >> "$tmp"
+        fi
+    done < "$REVENANT_CONFIG_FILE"
+    (( found )) || printf '%s = %s\n' "$key" "$val" >> "$tmp"
+    chmod 0600 "$tmp"; mv -f "$tmp" "$REVENANT_CONFIG_FILE"
+}
+
+_rv_cfg_unset() {   # key
+    [[ -f $REVENANT_CONFIG_FILE ]] || return 0
+    local tmp line k; tmp="$(mktemp "${REVENANT_CONFIG_FILE}.XXXX")"
+    while IFS= read -r line || [[ -n $line ]]; do
+        k="${line%%=*}"; k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        [[ $k == "$1" && $line == *=* && $line != \#* ]] && continue
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$REVENANT_CONFIG_FILE"
+    chmod 0600 "$tmp"; mv -f "$tmp" "$REVENANT_CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# settings.json hook (one per account config dir)
+# ---------------------------------------------------------------------------
+_rv_config_dirs() {   # prints the config dirs to install the hook into
+    if [[ ${#RV_ACCOUNT_DIR[@]} -gt 0 ]]; then
+        local n; for n in "${!RV_ACCOUNT_DIR[@]}"; do printf '%s\n' "${RV_ACCOUNT_DIR[$n]}"; done
+    else
+        printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    fi
+}
+
+_rv_hook() {   # add|remove  config_dir
+    local action="$1" dir="$2" settings="$2/settings.json" cmd="$REVENANT_HOME/record-session.sh"
+    command -v python3 >/dev/null 2>&1 || { warn "python3 missing; edit $settings by hand (command: $cmd)"; return 0; }
+    mkdir -p "$dir"
+    python3 -I - "$settings" "$cmd" "$action" <<'PY'
+import json, os, sys, time
+path, cmd, action = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    try: data = json.load(open(path))
+    except Exception as e:
+        print(f"  {path}: invalid JSON ({e}); skipped"); sys.exit(0)
+    json.dump(data, open(f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}","w"), indent=2)
+starts = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+has = any(h.get("command")==cmd for b in starts for h in b.get("hooks",[]))
+if action == "add":
+    if has: print(f"  {path}: hook already present")
+    else:
+        starts.append({"hooks":[{"type":"command","command":cmd}]})
+        json.dump(data, open(path,"w"), indent=2); print(f"  {path}: hook added")
+else:
+    new=[]
+    for b in starts:
+        hs=[h for h in b.get("hooks",[]) if not (h.get("type")=="command" and h.get("command")==cmd)]
+        if hs: b["hooks"]=hs; new.append(b)
+    if "hooks" in data:
+        if new: data["hooks"]["SessionStart"]=new
+        else: data["hooks"].pop("SessionStart",None)
+        if not data["hooks"]: data.pop("hooks",None)
+    json.dump(data, open(path,"w"), indent=2); print(f"  {path}: hook removed")
+PY
+}
+
+# ---------------------------------------------------------------------------
+# bashrc source line
+# ---------------------------------------------------------------------------
+_rv_bashrc_add() {
+    local rc="${1:-$HOME/.bashrc}" line="source \"$REVENANT_HOME/revenant.bash\""
+    if [[ -f $rc ]] && grep -qF "$REVENANT_HOME/revenant.bash" "$rc"; then
+        echo "  already sourced in $rc"
+    else
+        printf '\n# revenant\n%s\n' "$line" >> "$rc"
+        echo "  appended source line to $rc (keep it LAST)"
+    fi
+}
+_rv_bashrc_remove() {
+    local rc="${1:-$HOME/.bashrc}"
+    [[ -f $rc ]] && grep -qF "$REVENANT_HOME/revenant.bash" "$rc" || return 0
+    cp "$rc" "$rc.bak.$(date +%Y%m%d%H%M%S)"
+    grep -vF "$REVENANT_HOME/revenant.bash" "$rc" | grep -vxF "# revenant" > "$rc.tmp"
+    mv "$rc.tmp" "$rc"; echo "  removed source line from $rc"
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+# One-shot install. Accepts account specs + option overrides so a full setup is
+# a single command. On a FRESH install the defaults are auto_resume=on,
+# details=on, skip-permissions=on; re-running never resets options you changed
+# unless you pass the flag explicitly.
+#
+#   revenant install [--account NAME=DIR]... [--default NAME]
+#                       [--no-skip-permissions] [--no-auto-resume] [--no-details]
+#                       [--bashrc PATH]
+cmd_install() {
+    local bashrc="$HOME/.bashrc"
+    local -a specs=()
+    local default_acct="" skip=1 auto=1 details=1
+    local skip_set=0 auto_set=0 details_set=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --account)   specs+=("$2"); shift 2;;
+            --account=*) specs+=("${1#*=}"); shift;;
+            --default)   default_acct="$2"; shift 2;;
+            --default=*) default_acct="${1#*=}"; shift;;
+            --skip-permissions)    skip=1; skip_set=1; shift;;
+            --no-skip-permissions) skip=0; skip_set=1; shift;;
+            --auto-resume)         auto=1; auto_set=1; shift;;
+            --no-auto-resume)      auto=0; auto_set=1; shift;;
+            --details)             details=1; details_set=1; shift;;
+            --no-details)          details=0; details_set=1; shift;;
+            --bashrc)   bashrc="$2"; shift 2;;
+            --bashrc=*) bashrc="${1#*=}"; shift;;
+            -*) err "unknown option: $1"; return 1;;
+            *)  bashrc="$1"; shift;;   # bare positional = bashrc path
+        esac
+    done
+
+    say "Installing into $REVENANT_HOME"
+    mkdir -p "$REVENANT_HOME"; chmod 0700 "$REVENANT_HOME"
+    if [[ "$SRC_DIR" -ef "$REVENANT_HOME" ]]; then
+        say "Files already in place; skipping copy"
+    else
+        install -m 0755 "$SRC_DIR/record-session.sh" "$REVENANT_HOME/record-session.sh"
+        install -m 0644 "$SRC_DIR/revenant.bash"  "$REVENANT_HOME/revenant.bash"
+        install -m 0755 "$SRC_DIR/revenant"       "$REVENANT_HOME/revenant"
+    fi
+
+    # CLI on PATH
+    local bindir="$HOME/.local/bin"
+    if [[ ":$PATH:" == *":$bindir:"* ]]; then
+        mkdir -p "$bindir"; ln -sf "$REVENANT_HOME/revenant" "$bindir/revenant"
+        say "Linked CLI: $bindir/revenant"
+    else
+        warn "$bindir is not on PATH; run the CLI as $REVENANT_HOME/revenant"
+    fi
+
+    # config: create on first install with the three defaults ON
+    local fresh=0
+    if [[ ! -f $REVENANT_CONFIG_FILE ]]; then
+        fresh=1; umask 077
+        printf '# revenant config (edit with: revenant config set <key> <value>)\n' > "$REVENANT_CONFIG_FILE"
+        say "Created $REVENANT_CONFIG_FILE"
+        _rv_cfg_set auto_resume 1
+        _rv_cfg_set details 1
+        _rv_cfg_set resume_flags "--dangerously-skip-permissions"
+    fi
+    # explicit flag overrides (apply fresh or not; never clobber silently)
+    (( auto_set ))    && _rv_cfg_set auto_resume "$auto"
+    (( details_set )) && _rv_cfg_set details "$details"
+    if (( skip_set )); then
+        if (( skip )); then _rv_cfg_set resume_flags "--dangerously-skip-permissions"
+        else _rv_cfg_unset resume_flags; fi
+    fi
+    # accounts + default
+    local spec name dir
+    for spec in "${specs[@]}"; do
+        name="${spec%%=*}"; dir="${spec#*=}"
+        [[ -n $name && -n $dir && $name != "$dir" ]] || { warn "bad --account '$spec' (expected NAME=DIR)"; continue; }
+        _rv_cfg_set "account.$name.config_dir" "$dir"
+        say "account '$name' -> $dir"
+    done
+    [[ -n $default_acct ]] && { _rv_cfg_set default_account "$default_acct"; say "default account -> $default_acct"; }
+
+    _revenant_load_config   # reload so the hook step sees new accounts
+
+    say "Installing SessionStart hook"
+    local d; while IFS= read -r d; do _rv_hook add "$d"; done < <(_rv_config_dirs)
+
+    say "Wiring up ~/.bashrc"
+    _rv_bashrc_add "$bashrc"
+
+    echo; say "Done. Open a NEW Warp tab, then: revenant doctor"
+}
+
+# One-shot uninstall. --purge also deletes the .bak backups the installers left.
+cmd_uninstall() {
+    local bashrc="$HOME/.bashrc" purge=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge) purge=1; shift;;
+            --bashrc) bashrc="$2"; shift 2;;
+            --bashrc=*) bashrc="${1#*=}"; shift;;
+            -*) err "unknown option: $1"; return 1;;
+            *) bashrc="$1"; shift;;
+        esac
+    done
+    # capture the config dirs BEFORE removing anything (purge needs them).
+    local -a cdirs=(); local d
+    while IFS= read -r d; do cdirs+=("$d"); done < <(_rv_config_dirs)
+
+    say "Removing SessionStart hook"
+    for d in "${cdirs[@]}"; do [[ -f $d/settings.json ]] && _rv_hook remove "$d"; done
+    say "Cleaning ~/.bashrc"; _rv_bashrc_remove "$bashrc"
+    local bindir="$HOME/.local/bin"
+    [[ -L $bindir/revenant ]] && rm -f "$bindir/revenant" && echo "  removed $bindir/revenant"
+    [[ -d $REVENANT_HOME ]] && { rm -rf "$REVENANT_HOME"; say "Removed $REVENANT_HOME"; }
+    # purge LAST so it also catches the .bak files just created by the steps above.
+    if (( purge )); then
+        say "Purging installer backups (.bak.*)"
+        for d in "${cdirs[@]}"; do rm -f "$d"/settings.json.bak.* 2>/dev/null; done
+        rm -f "$bashrc".bak.* 2>/dev/null
+    fi
+    say "Done. Conversations in your Claude config dirs are untouched."
+}
+
+cmd_doctor() {
+    local ok=1
+    echo "revenant doctor"
+    # shell
+    if [[ -n ${BASH_VERSION:-} ]]; then
+        if (( ${BASH_VERSINFO[0]} >= 5 )); then printf '  %s✓%s bash %s\n' "$c_ok" "$c_off" "$BASH_VERSION"
+        else printf '  %s!%s bash %s (tested on 5.x; may work)\n' "$c_warn" "$c_off" "$BASH_VERSION"; fi
+    else printf '  %s✗%s not bash — revenant targets bash\n' "$c_err" "$c_off"; ok=0; fi
+    # warp
+    if [[ ${TERM_PROGRAM:-} == WarpTerminal || -n ${WARP_TERMINAL_SESSION_UUID:-} ]]; then
+        local v="${WARP_CLIENT_VERSION:-unknown}"
+        if [[ $v == ${REVENANT_TESTED_WARP}* ]]; then printf '  %s✓%s Warp %s\n' "$c_ok" "$c_off" "$v"
+        else printf '  %s!%s Warp %s (tested against %s*; should still work)\n' "$c_warn" "$c_off" "$v" "$REVENANT_TESTED_WARP"; fi
+    else printf '  %s!%s not inside Warp (resume only works in Warp panes)\n' "$c_warn" "$c_off"; fi
+    # claude
+    if command -v claude >/dev/null 2>&1; then printf '  %s✓%s claude: %s\n' "$c_ok" "$c_off" "$(command -v claude)"
+    else printf '  %s✗%s claude not on PATH\n' "$c_err" "$c_off"; ok=0; fi
+    # python3 (optional)
+    if command -v python3 >/dev/null 2>&1; then printf '  %s✓%s python3 (rich preview)\n' "$c_ok" "$c_off"
+    else printf '  %s!%s python3 missing (preview degrades; core still works)\n' "$c_warn" "$c_off"; fi
+    # hook + source line
+    local d; while IFS= read -r d; do
+        if [[ -f $d/settings.json ]] && grep -q record-session.sh "$d/settings.json" 2>/dev/null; then
+            printf '  %s✓%s hook in %s\n' "$c_ok" "$c_off" "$d/settings.json"
+        else printf '  %s✗%s hook MISSING in %s (run: revenant install)\n' "$c_err" "$c_off" "$d/settings.json"; ok=0; fi
+    done < <(_rv_config_dirs)
+    if grep -qF "$REVENANT_HOME/revenant.bash" "$HOME/.bashrc" 2>/dev/null; then
+        printf '  %s✓%s sourced from ~/.bashrc\n' "$c_ok" "$c_off"
+    else printf '  %s✗%s not sourced from ~/.bashrc (run: revenant install)\n' "$c_err" "$c_off"; ok=0; fi
+    echo; (( ok )) && say "All good." || warn "Some checks failed (see above)."
+}
+
+cmd_config() {
+    case "${1:-list}" in
+        list|'') [[ -f $REVENANT_CONFIG_FILE ]] && { echo "# $REVENANT_CONFIG_FILE"; grep -v '^[[:space:]]*#' "$REVENANT_CONFIG_FILE" | grep -v '^[[:space:]]*$' || true; } || echo "(no config file; using defaults)";;
+        get)  [[ -n ${2:-} ]] || { err "usage: revenant config get <key>"; return 1; }
+              printf '%s\n' "${RV_CFG[$2]:-}";;
+        set)  [[ -n ${2:-} && $# -ge 3 ]] || { err "usage: revenant config set <key> <value>"; return 1; }
+              local k="$2"; shift 2; _rv_cfg_set "$k" "$*"; echo "  set $k = $*";;
+        unset) [[ -n ${2:-} ]] || { err "usage: revenant config unset <key>"; return 1; }
+              _rv_cfg_unset "$2"; echo "  unset $2";;
+        *) err "unknown: config $1"; return 1;;
+    esac
+}
+
+cmd_account() {
+    case "${1:-list}" in
+        list|'')
+            if [[ ${#RV_ACCOUNT_DIR[@]} -eq 0 ]]; then echo "single-account mode (${CLAUDE_CONFIG_DIR:-$HOME/.claude})"; else
+                local n; for n in "${!RV_ACCOUNT_DIR[@]}"; do
+                    printf '%-12s %s%s%s\n' "$n" "${RV_ACCOUNT_DIR[$n]}" \
+                        "${RV_ACCOUNT_ROOTS[$n]:+  roots=${RV_ACCOUNT_ROOTS[$n]}}" \
+                        "$([[ $n == ${RV_CFG[default_account]} ]] && printf '  (default)')"
+                done; fi;;
+        add)  # account add <name> <config_dir> [root[:root...]]
+            [[ -n ${2:-} && -n ${3:-} ]] || { err "usage: revenant account add <name> <config_dir> [roots]"; return 1; }
+            _rv_cfg_set "account.$2.config_dir" "$3"
+            [[ -n ${4:-} ]] && _rv_cfg_set "account.$2.roots" "$4"
+            echo "  account '$2' -> $3${4:+  roots=$4}"
+            echo "  (run 'revenant install' to add its SessionStart hook)";;
+        remove) [[ -n ${2:-} ]] || { err "usage: revenant account remove <name>"; return 1; }
+            _rv_cfg_unset "account.$2.config_dir"; _rv_cfg_unset "account.$2.roots"; echo "  removed account '$2'";;
+        default) [[ -n ${2:-} ]] || { err "usage: revenant account default <name>"; return 1; }
+            _rv_cfg_set default_account "$2"; echo "  default account = $2";;
+        *) err "unknown: account $1"; return 1;;
+    esac
+}
+
+cmd_enable()  { _rv_toggle 1 "$@"; }
+cmd_disable() { _rv_toggle 0 "$@"; }
+_rv_toggle() {
+    local on="$1" feat="${2:-}"
+    case "$feat" in
+        auto-resume|auto_resume) _rv_cfg_set auto_resume "$on"; echo "  auto_resume = $on";;
+        details)                 _rv_cfg_set details "$on";     echo "  details = $on";;
+        skip-permissions)
+            if (( on )); then _rv_cfg_set resume_flags "--dangerously-skip-permissions"; echo "  resume_flags = --dangerously-skip-permissions"
+            else _rv_cfg_unset resume_flags; echo "  resume_flags cleared"; fi;;
+        *) err "unknown feature '$feat' (auto-resume|details|skip-permissions)"; return 1;;
+    esac
+}
+
+cmd_help() {
+    cat <<EOF
+${c_cyan}revenant${c_off} — reattach restored Warp panes to their Claude Code session
+
+${c_dim}runtime (from your shell):${c_off}
+  revenant resume            resume this pane's session now
+  revenant list              list recorded pane → session mappings
+  revenant forget            drop this pane's record
+  revenant status            show effective config + this pane
+
+${c_dim}setup / config:${c_off}
+  revenant install [--account NAME=DIR]... [--default NAME]
+                      [--no-skip-permissions] [--no-auto-resume] [--no-details]
+                              full setup in one command (fresh install defaults:
+                              auto-resume + details + skip-permissions ON)
+  revenant uninstall [--purge]   undo everything (--purge also deletes .bak backups)
+  revenant doctor            check environment + install
+  revenant config list|get <k>|set <k> <v>|unset <k>
+  revenant account list|add <name> <dir> [roots]|remove <name>|default <name>
+  revenant enable|disable <auto-resume|details|skip-permissions>
+
+${c_dim}keys:${c_off} auto_resume(1) details(1) max_age(604800) resume_flags() default_account()
+EOF
+}
+
+# ---------------------------------------------------------------------------
+case "${1:-help}" in
+    install)   shift; cmd_install   "$@";;
+    uninstall) shift; cmd_uninstall "$@";;
+    doctor)    shift; cmd_doctor    "$@";;
+    config)    shift; cmd_config    "$@";;
+    account)   shift; cmd_account   "$@";;
+    enable)    shift; cmd_enable    "$@";;
+    disable)   shift; cmd_disable   "$@";;
+    list)      shift; _revenant_cmd_list "$@";;
+    status)    shift; _revenant_cmd_status "$@";;
+    resume|forget) err "'$1' must run from your shell (it's a shell function). Open a Warp tab and run: revenant $1";;
+    help|-h|--help|'') cmd_help;;
+    *) err "unknown command '$1'"; cmd_help; exit 1;;
+esac

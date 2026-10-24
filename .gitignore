@@ -1,0 +1,5 @@
+# local state (should never be committed)
+panes/
+*.bak
+*.bak.*
+.tmp.*
