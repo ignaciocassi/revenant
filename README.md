@@ -1,4 +1,4 @@
-# revenant
+# Revenant - Auto-restore Claude Code sessions in Warp
 
 Warp restores your terminal panes after a restart — but the **Claude Code**
 sessions that were running inside them don't. This reattaches each restored pane
